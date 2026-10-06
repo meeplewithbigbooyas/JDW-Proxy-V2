@@ -449,6 +449,53 @@ def _compact_schema_fields(schema: Dict[str, Any], depth: int = 1) -> str:
     return ", ".join(parts)
 
 
+def _tool_capability_hint(name: str, desc: str = "") -> str:
+    """Return a SHORT, concrete capability note tailored to THIS tool, keyed off
+    its name/description. Tells the model, in plain terms, the useful things it
+    can actually do with the tool (e.g. 'with me you can push to GitHub') instead
+    of a generic blurb. Empty string if we have no specific hint."""
+    n = (name or "").lower()
+    d = (desc or "").lower()
+    def has(*subs: str) -> bool:
+        return any(s in n or s in d for s in subs)
+    # Shell / command runners
+    if has("pwsh", "powershell", "bash", "shell", "terminal", "command", "exec", "run_command"):
+        return ("With me you run real commands on this machine. You CAN: `git add/commit/push` "
+                "to upload a project to GitHub, install packages, move/zip files, start servers. "
+                "Put the WHOLE command (even multi-line git here-strings) in `input` and CALL me — "
+                "never just print the command as a code block.")
+    # Image fetch / vision by URL
+    if has("fetch_image", "image", "screenshot", "vision", "img"):
+        return ("With me you download an image from a URL and SEE it directly, so you can read "
+                "text in it, describe it, or compare screenshots.")
+    # URL / web fetch
+    if has("fetch_url", "web_fetch", "open_url", "browse", "http_get"):
+        return ("With me you open a URL and read its page content as text — use me to pull docs, "
+                "API responses, or a raw file off the web.")
+    # Web search
+    if has("web_search", "search"):
+        return ("With me you search the web for current info and get back result links/snippets "
+                "to fetch next.")
+    # Write / create files
+    if has("write", "create_file", "new_file"):
+        return ("With me you create or fully overwrite a file on disk — pass the full final "
+                "content, not a diff.")
+    # Edit files
+    if has("edit", "replace", "patch", "apply_diff"):
+        return ("With me you edit an existing file by replacing exact text — read it first so "
+                "your old-text match is precise.")
+    # Read files
+    if has("read", "cat", "open_file", "view"):
+        return ("With me you read a file's exact contents from disk before changing or quoting it.")
+    # Search in files
+    if has("grep", "ripgrep", "find_in"):
+        return ("With me you search file CONTENTS by regex to locate code/text fast.")
+    # Glob / find files
+    if has("glob", "find", "list_files"):
+        return ("With me you find files by path pattern (e.g. **/*.py).")
+    return ""
+
+
 def build_tool_system_block(tools: List[Dict[str, Any]],
                             tool_choice: Optional[Dict[str, Any]],
                             compact: bool = False,
@@ -467,16 +514,25 @@ def build_tool_system_block(tools: List[Dict[str, Any]],
                 line += f": {short}"
             if fields:
                 line += f"  [{fields}]"
+            hint = _tool_capability_hint(name, desc)
+            if hint:
+                line += f"\n    → {hint}"
             lines.append(line + "\n")
         elif compact:
             # short description (first line / first ~200 chars) + field summary
             short = desc.strip().split("\n", 1)[0][:200]
             fields = _compact_schema_fields(schema)
             lines.append(f"\n#### `{name}`\n{short}\n")
+            hint = _tool_capability_hint(name, desc)
+            if hint:
+                lines.append(f"What you can do with it: {hint}\n")
             if fields:
                 lines.append(f"Params ( * = required ): {fields}\n")
         else:
             lines.append(f"\n#### `{name}`\n{desc}\n")
+            hint = _tool_capability_hint(name, desc)
+            if hint:
+                lines.append(f"What you can do with it: {hint}\n")
             try:
                 schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
             except Exception:
