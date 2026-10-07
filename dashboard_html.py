@@ -76,6 +76,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .saved.show{opacity:1}
   .empty{color:var(--muted);text-align:center;padding:30px}
   @media(max-width:900px){main{grid-template-columns:1fr}}
+
+  body{background:radial-gradient(circle at 15% 0%,#17233b 0,#0b0f16 42%,#070a0f 100%);min-height:100vh}
+  header{background:rgba(14,19,29,.82);backdrop-filter:blur(18px);position:sticky;top:0;z-index:10;box-shadow:0 8px 30px #0004}
+  .card{background:rgba(20,27,39,.78);backdrop-filter:blur(14px);border-color:#ffffff14;box-shadow:0 12px 35px #0003}
+  .card h2{font-size:11px;letter-spacing:.12em}
+  input[type=text],select,textarea{background:#0d1420;border-color:#ffffff18;transition:.18s}
+  input[type=text]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4493f81c}
+  button.primary{box-shadow:0 8px 20px #2ea04325}
+  .endpoint{background:linear-gradient(135deg,#0d1828,#101621);border-color:#4493f833}
+  table{border-radius:8px;overflow:hidden}
+  th{background:#0d131e}
+  .healthbar{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid #ffffff12;border-radius:9px;background:#0b111a;margin-top:10px}
+  .healthdot{width:8px;height:8px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 transparent}
+  .healthdot.good{background:var(--accent2);box-shadow:0 0 10px #2ea04388}.healthdot.bad{background:var(--danger);box-shadow:0 0 10px #f8514988}
+  .healthtext{font-size:12px;color:var(--muted)}
+  @media(max-width:1100px){main{grid-template-columns:330px 1fr}}
 </style>
 </head>
 <body>
@@ -92,6 +108,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card">
       <h2 data-i="endpointTitle">Client endpoint</h2>
       <div class="endpoint" id="endpointUrl">http://localhost:8181/v1</div>
+      <div class="healthbar"><span id="upstreamHealthDot" class="healthdot"></span><span id="upstreamHealthText" class="healthtext">Checking upstream…</span></div>
       <p class="hint" data-i="endpointHint" style="color:var(--muted);margin:10px 0 0;font-size:12px">
         Point your Anthropic client's base URL here. Use your JDW key as the API key.</p>
     </div>
@@ -117,6 +134,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span class="plus">+</span><span data-i="addkey">Add fallback key</span>
         </button>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Performance & resilience</h2>
+      <div class="row"><label>Concurrent upstream requests<span class="hint">Caps simultaneous upstream calls so one outage cannot exhaust the proxy.</span></label><input id="max_concurrent_upstream" type="text" style="width:90px"/></div>
+      <div class="row"><label>Request timeout<span class="hint">Total upstream deadline, in seconds.</span></label><input id="upstream_timeout_s" type="text" style="width:90px"/></div>
+      <div class="row"><label>Retry attempts<span class="hint">Transient 429/5xx/network failures only.</span></label><input id="retry_max_attempts" type="text" style="width:90px"/></div>
+      <div class="row"><label>Circuit breaker cooldown<span class="hint">Seconds to stop sending traffic after repeated upstream failures.</span></label><input id="circuit_breaker_cooldown_s" type="text" style="width:90px"/></div>
     </div>
 
     <div class="card">
@@ -312,6 +337,10 @@ async function loadConfig(){
   document.getElementById('apikey').value=c.api_key_masked||'';
   renderFbKeys(c.fallback_api_keys_masked||[]);
   const f=c.features||{};
+  document.getElementById('max_concurrent_upstream').value=c.max_concurrent_upstream||8;
+  document.getElementById('upstream_timeout_s').value=c.upstream_timeout_s||90;
+  document.getElementById('retry_max_attempts').value=c.retry_max_attempts||3;
+  document.getElementById('circuit_breaker_cooldown_s').value=c.circuit_breaker_cooldown_s||20;
   document.getElementById('tool_injection').checked=!!f.tool_injection;
   document.getElementById('strict_tool_names').checked=f.strict_tool_names!==false;
   document.getElementById('flatten_tool_history').checked=!!f.flatten_tool_history;
@@ -336,6 +365,10 @@ async function saveConfig(){
   const body={
     upstream_base_url:document.getElementById('upstream').value,
     model:document.getElementById('model').value,
+    max_concurrent_upstream:parseInt(document.getElementById('max_concurrent_upstream').value)||8,
+    upstream_timeout_s:parseInt(document.getElementById('upstream_timeout_s').value)||90,
+    retry_max_attempts:parseInt(document.getElementById('retry_max_attempts').value)||3,
+    circuit_breaker_cooldown_s:parseInt(document.getElementById('circuit_breaker_cooldown_s').value)||20,
     features:{
       tool_injection:document.getElementById('tool_injection').checked,
       strict_tool_names:document.getElementById('strict_tool_names').checked,
@@ -427,6 +460,17 @@ async function pollLogs(){
     document.getElementById('statusDot').className='dot on';
   }catch(e){ document.getElementById('statusDot').className='dot off'; }
 }
+async function pollHealth(){
+  try{
+    const r=await fetch('/admin/health'); const h=await r.json();
+    const dot=document.getElementById('upstreamHealthDot'), text=document.getElementById('upstreamHealthText');
+    dot.className='healthdot '+(h.ok?'good':'bad');
+    text.textContent=h.ok ? ('Upstream online · '+h.status+' · '+h.latency_ms+' ms') : ('Upstream unavailable · '+(h.status||'network error')+' · '+(h.error||''));
+  }catch(e){
+    document.getElementById('upstreamHealthDot').className='healthdot bad';
+    document.getElementById('upstreamHealthText').textContent='Health check failed';
+  }
+}
 async function clearLogs(){ await fetch('/admin/logs/clear',{method:'POST'}); pollLogs(); }
 async function stopProxy(){
   var msg=(LANG==='ru')?'\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u043f\u0440\u043e\u043a\u0441\u0438? \u041f\u043e\u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u0440\u0443\u0447\u043d\u043e\u0439 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a.':'Stop the proxy? You will need to start it again manually.';
@@ -441,7 +485,9 @@ async function stopProxy(){
 
 loadConfig();
 pollLogs();
+pollHealth();
 setInterval(pollLogs,2000);
+setInterval(pollHealth,10000);
 </script>
 </body>
 </html>

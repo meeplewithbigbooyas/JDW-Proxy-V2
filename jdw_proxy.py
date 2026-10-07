@@ -70,7 +70,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "listen_host": "127.0.0.1",
     "listen_port": 8181,
     "model": "claude-opus-4-8",
-    "upstream_timeout_s": 300,
+    "upstream_timeout_s": 90,
+    "upstream_connect_timeout_s": 8,
+    "upstream_write_timeout_s": 30,
+    "upstream_pool_timeout_s": 5,
+    "max_concurrent_upstream": 8,
+    "retry_max_attempts": 3,
+    "retry_backoff_s": [0.8, 2.0],
+    "circuit_breaker_failures": 4,
+    "circuit_breaker_cooldown_s": 20,
     "features": {
         "tool_injection": True,
         "strict_tool_names": True,
@@ -136,6 +144,39 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 _config_lock = threading.RLock()
+_UPSTREAM_SEMAPHORE = asyncio.Semaphore(8)
+_CIRCUIT_LOCK = threading.Lock()
+_CIRCUIT = {"failures": 0, "opened_at": 0.0, "last_error": "", "last_status": 0}
+_HEALTH_CACHE = {"ts": 0.0, "ok": False, "status": 0, "latency_ms": None, "error": ""}
+
+
+def _reset_runtime_limits() -> None:
+    global _UPSTREAM_SEMAPHORE
+    limit = max(1, int(CONFIG.get("max_concurrent_upstream", 8) or 8))
+    _UPSTREAM_SEMAPHORE = asyncio.Semaphore(limit)
+
+
+def _circuit_open() -> bool:
+    with _CIRCUIT_LOCK:
+        opened = float(_CIRCUIT.get("opened_at", 0) or 0)
+        cooldown = float(CONFIG.get("circuit_breaker_cooldown_s", 20) or 20)
+        return opened > 0 and (time.time() - opened) < cooldown
+
+
+def _circuit_success() -> None:
+    with _CIRCUIT_LOCK:
+        _CIRCUIT.update({"failures": 0, "opened_at": 0.0, "last_error": "", "last_status": 0})
+
+
+def _circuit_failure(status: int = 0, error: str = "") -> None:
+    with _CIRCUIT_LOCK:
+        _CIRCUIT["failures"] = int(_CIRCUIT.get("failures", 0)) + 1
+        _CIRCUIT["last_status"] = status
+        _CIRCUIT["last_error"] = str(error)[:300]
+        threshold = max(1, int(CONFIG.get("circuit_breaker_failures", 4) or 4))
+        if _CIRCUIT["failures"] >= threshold:
+            _CIRCUIT["opened_at"] = time.time()
+
 
 
 def load_config() -> Dict[str, Any]:
@@ -152,6 +193,10 @@ def load_config() -> Dict[str, Any]:
                     cfg[k] = v
         except Exception as e:
             print(f"[config] failed to read {CONFIG_PATH}: {e}")
+    # Prefer an environment key when configured; this keeps secrets out of config.json.
+    env_key = os.environ.get("JDW_API_KEY", "").strip()
+    if env_key:
+        cfg["api_key"] = env_key
     return cfg
 
 
@@ -162,6 +207,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 
 CONFIG = load_config()
+_reset_runtime_limits()
 
 # Opt-in debug: when JDW_DEBUG_TOOL_LEAK=1 the proxy scans the FINAL content it
 # is about to return and logs a `tool_leak` event if a raw tool-call (an
@@ -1717,7 +1763,12 @@ async def resolve_server_tools(payload: Dict[str, Any],
         return status, upstream
 
     max_iters = int(feats.get("web_tools_max_iters", 4) or 4)
-    timeout = httpx.Timeout(float(CONFIG.get("upstream_timeout_s", 300)))
+    timeout = httpx.Timeout(
+        timeout=float(CONFIG.get("upstream_timeout_s", 90) or 90),
+        connect=float(CONFIG.get("upstream_connect_timeout_s", 8) or 8),
+        write=float(CONFIG.get("upstream_write_timeout_s", 30) or 30),
+        pool=float(CONFIG.get("upstream_pool_timeout_s", 5) or 5),
+    )
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as web_client:
         for _it in range(max_iters):
             raw_text = _raw_assistant_text(upstream)
@@ -2195,6 +2246,23 @@ def anthropic_error(status: int, err_type: str, message: str) -> JSONResponse:
     )
 
 
+def _upstream_auth_headers(api_key: str, *, json_body: bool = True) -> Dict[str, str]:
+    """Build upstream request headers. CRUCIAL: when the key is empty we must
+    OMIT the auth headers entirely -- an empty 'Authorization: Bearer ' value
+    (trailing space) is an illegal HTTP header value and makes httpx/h11 raise
+    'Illegal header value b\\'Bearer \\'' on every request instead of a clean
+    401. We send both x-api-key and Bearer when a key is present (some relays
+    check one, some the other)."""
+    headers: Dict[str, str] = {"anthropic-version": "2023-06-01"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    key = (api_key or "").strip()
+    if key:
+        headers["x-api-key"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
                        payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Optional[Exception]]:
     """Run the full retry loop for a SINGLE api key.
@@ -2205,12 +2273,7 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
     # Send BOTH auth styles: some upstreams expect Anthropic-native `x-api-key`,
     # others expect `Authorization: Bearer`. Sending both is safe and fixes
     # sporadic "API key is invalid" when the relay checks the other header.
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "Authorization": f"Bearer {api_key}",
-        "anthropic-version": "2023-06-01",
-    }
+    headers = _upstream_auth_headers(api_key, json_body=True)
     # NOTE: 401/403 are NOT retried here -- a real key rejection is handled ONCE
     # by call_upstream (it moves to the fallback key). Retrying auth errors here
     # would multiply requests (3x per key x 2 keys = 6) and hammer an already
@@ -2222,8 +2285,8 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
     # Heavy requests (large context + thinking + stream) sometimes get their
     # response truncated mid-JSON by the relay. That is transient, so we retry
     # several times with growing back-off to give the relay time to free a slot.
-    backoff = [1.0, 2.5, 4.0, 6.0]  # waited BEFORE attempts 2,3,4,5
-    max_attempts = 5
+    backoff = [float(x) for x in (CONFIG.get("retry_backoff_s") or [0.8, 2.0])]
+    max_attempts = max(1, int(CONFIG.get("retry_max_attempts", 3) or 3))
     status = 0
     data: Dict[str, Any] = {}
     last_exc: Optional[Exception] = None
@@ -2302,7 +2365,6 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
 
 async def call_upstream(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     url = CONFIG["upstream_base_url"].rstrip("/") + "/messages"
-    # Build the ordered, de-duplicated key list: primary first, then fallbacks.
     keys: List[str] = []
     primary = CONFIG.get("api_key", "") or ""
     if primary:
@@ -2312,42 +2374,57 @@ async def call_upstream(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         if k and k not in keys:
             keys.append(k)
     if not keys:
-        keys = [""]  # preserve old behaviour (send empty key, let upstream 401)
+        # No key anywhere (config.json empty AND no JDW_API_KEY env var). Fail
+        # fast with a clear, actionable message instead of firing keyless
+        # requests that the relay rejects (and which used to crash on the empty
+        # 'Bearer ' header). This is the exact state the dashboard shows as a
+        # masked-but-empty key.
+        log_event({"model": payload.get("model"), "status": 401,
+                   "error": "no API key configured"})
+        return 401, {"error": {"type": "authentication_error",
+                               "message": ("No JDW API key configured. Open the "
+                                           "dashboard and paste your key into the "
+                                           "'API key' field, then Save.")}}
 
-    timeout = httpx.Timeout(float(CONFIG.get("upstream_timeout_s", 300)))
-    # A genuine key rejection -> try the next key in the list.
+    timeout = httpx.Timeout(
+        timeout=float(CONFIG.get("upstream_timeout_s", 90) or 90),
+        connect=float(CONFIG.get("upstream_connect_timeout_s", 8) or 8),
+        write=float(CONFIG.get("upstream_write_timeout_s", 30) or 30),
+        pool=float(CONFIG.get("upstream_pool_timeout_s", 5) or 5),
+    )
     auth_reject = {401, 403}
     status = 0
     data: Dict[str, Any] = {}
     last_exc: Optional[Exception] = None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for idx, key in enumerate(keys):
-            if idx > 0:
-                log_event({"fallback_key": idx, "after_status": status,
-                           "note": "primary key rejected -> trying fallback key"})
-            status, data, last_exc = await _try_one_key(client, url, key, payload)
-            # Success or a real (non-auth) error -> stop, this is the answer.
-            if status < 400 or status not in auth_reject:
-                if last_exc is not None and status == 0:
-                    # all attempts for this key were network failures;
-                    # try the next key too (maybe a different endpoint path works)
-                    if idx < len(keys) - 1:
-                        continue
-                    raise last_exc
-                if status < 400:
-                    # Record which key actually worked (masked, never full).
-                    log_event({"key_used": "primary" if idx == 0 else f"fallback#{idx}",
-                               "key_masked": masked_key(key), "status": status,
-                               "note": "upstream OK with this key"})
-                return status, data
-            # auth rejection -> record the dead key, then loop to next one
-            log_event({"key_rejected": "primary" if idx == 0 else f"fallback#{idx}",
-                       "key_masked": masked_key(key), "status": status,
-                       "note": "key rejected by upstream (401/403)"})
-    if last_exc is not None and status == 0:
-        raise last_exc
-    return status, data
 
+    if _circuit_open():
+        raise RuntimeError("upstream circuit breaker is open; retry shortly")
+
+    limit = max(2, int(CONFIG.get("max_concurrent_upstream", 8) or 8))
+    async with _UPSTREAM_SEMAPHORE:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(
+                max_connections=limit,
+                max_keepalive_connections=limit,
+            ),
+        ) as client:
+            for idx, key in enumerate(keys):
+                if idx > 0:
+                    log_event({"fallback_key": idx, "after_status": status,
+                               "note": "previous key rejected -> trying fallback key"})
+                status, data, last_exc = await _try_one_key(client, url, key, payload)
+                if status < 400 or status not in auth_reject:
+                    if last_exc is not None and status == 0:
+                        if idx < len(keys) - 1:
+                            continue
+                        raise last_exc
+                    _circuit_success()
+                    if status < 400:
+                        log_event({"key_used": "primary" if idx == 0 else f"fallback#{idx}",
+                                   "key_masked": masked_key(key), "status": status,
+                                   "note": "upstream OK with this key"})
+                    return status, data
 
 @app.post("/v1/messages")
 async def v1_messages(request: Request):
@@ -2447,6 +2524,147 @@ async def v1_messages(request: Request):
     return JSONResponse(content=message)
 
 
+@app.get("/health")
+async def health():
+    with _CIRCUIT_LOCK:
+        circuit = dict(_CIRCUIT)
+    return JSONResponse(content={
+        "ok": not _circuit_open(),
+        "service": "jdw-proxy",
+        "upstream": CONFIG.get("upstream_base_url"),
+        "circuit": circuit,
+        "limits": {
+            "max_concurrent_upstream": CONFIG.get("max_concurrent_upstream", 8),
+            "timeout_s": CONFIG.get("upstream_timeout_s", 90),
+        },
+    })
+
+
+@app.get("/admin/health")
+async def admin_health():
+    now = time.time()
+    if now - float(_HEALTH_CACHE.get("ts", 0)) < 10:
+        return JSONResponse(content=dict(_HEALTH_CACHE))
+    started = time.perf_counter()
+    url = CONFIG["upstream_base_url"].rstrip("/") + "/models"
+    key = CONFIG.get("api_key", "") or ""
+    headers = _upstream_auth_headers(key, json_body=False)
+    result = {"ts": now, "ok": False, "status": 0, "latency_ms": None, "error": ""}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8, connect=4)) as client:
+            r = await client.get(url, headers=headers)
+            result["status"] = r.status_code
+            result["ok"] = r.status_code < 400
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            if not result["ok"]:
+                result["error"] = (r.text or "")[:180]
+    except Exception as e:
+        result["error"] = str(e)[:180]
+        result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    _HEALTH_CACHE.update(result)
+    return JSONResponse(content=result)
+
+
+
+def _openai_to_anthropic(req: Dict[str, Any]) -> Dict[str, Any]:
+    messages = []
+    system_parts = []
+    for m in req.get("messages") or []:
+        role, content = m.get("role"), m.get("content")
+        if role == "system":
+            system_parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+        elif role in ("user", "assistant"):
+            messages.append({"role": role, "content": content if content is not None else ""})
+        elif role == "tool":
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": m.get("tool_call_id", "toolu_unknown"),
+                "content": content if content is not None else "",
+            }]})
+    out = {"model": req.get("model") or CONFIG["model"], "messages": messages,
+           "stream": bool(req.get("stream")),
+           "max_tokens": req.get("max_tokens") or req.get("max_completion_tokens") or 4096}
+    if system_parts: out["system"] = "\n\n".join(system_parts)
+    for k in ("temperature", "top_p"):
+        if k in req and req[k] is not None: out[k] = req[k]
+    if req.get("stop") is not None:
+        out["stop_sequences"] = req["stop"] if isinstance(req["stop"], list) else [req["stop"]]
+    tools=[]
+    for t in req.get("tools") or []:
+        fn=t.get("function") or {}
+        if fn.get("name"):
+            tools.append({"name":fn["name"],"description":fn.get("description",""),
+                          "input_schema":fn.get("parameters") or {"type":"object"}})
+    if tools: out["tools"]=tools
+    tc=req.get("tool_choice")
+    if tc=="auto": out["tool_choice"]={"type":"auto"}
+    elif tc=="none": out["tool_choice"]={"type":"none"}
+    elif isinstance(tc,dict) and isinstance(tc.get("function"),dict):
+        out["tool_choice"]={"type":"tool","name":tc["function"].get("name","")}
+    return out
+
+
+def _anthropic_to_openai(message: Dict[str, Any], request_model: str) -> Dict[str, Any]:
+    text=[]; tool_calls=[]
+    for b in message.get("content",[]) or []:
+        if b.get("type")=="text": text.append(b.get("text",""))
+        elif b.get("type")=="tool_use":
+            tool_calls.append({"id":b.get("id") or ("call_"+uuid.uuid4().hex[:12]),
+                               "type":"function","function":{"name":b.get("name",""),
+                               "arguments":json.dumps(b.get("input") or {},ensure_ascii=False)}})
+    finish={"end_turn":"stop","max_tokens":"length","tool_use":"tool_calls","stop_sequence":"stop"}.get(
+        message.get("stop_reason"),"stop")
+    u=message.get("usage") or {}; inp=int(u.get("input_tokens",0) or 0); out=int(u.get("output_tokens",0) or 0)
+    msg={"role":"assistant","content":"\n\n".join(text) if text else None}
+    if tool_calls: msg["tool_calls"]=tool_calls
+    return {"id":message.get("id") or ("chatcmpl_"+uuid.uuid4().hex[:16]),
+            "object":"chat.completion","created":int(time.time()),
+            "model":request_model or message.get("model") or CONFIG["model"],
+            "choices":[{"index":0,"message":msg,"finish_reason":finish}],
+            "usage":{"prompt_tokens":inp,"completion_tokens":out,"total_tokens":inp+out}}
+
+
+async def _openai_stream(message: Dict[str, Any], model: str):
+    data=_anthropic_to_openai(message,model); choice=data["choices"][0]; msg=choice["message"]
+    content=msg.get("content")
+    if content:
+        for chunk in chunk_text(content,80):
+            yield "data: "+json.dumps({"id":data["id"],"object":"chat.completion.chunk","created":data["created"],
+                "model":data["model"],"choices":[{"index":0,"delta":{"role":"assistant","content":chunk},"finish_reason":None}],
+                },ensure_ascii=False)+"\n\n"
+            await asyncio.sleep(0)
+    if msg.get("tool_calls"):
+        for tc in msg["tool_calls"]:
+            yield "data: "+json.dumps({"id":data["id"],"object":"chat.completion.chunk","created":data["created"],
+                "model":data["model"],"choices":[{"index":0,"delta":{"tool_calls":[tc]},"finish_reason":None}]},
+                ensure_ascii=False)+"\n\n"
+    yield "data: "+json.dumps({"id":data["id"],"object":"chat.completion.chunk","created":data["created"],
+        "model":data["model"],"choices":[{"index":0,"delta":{},"finish_reason":choice["finish_reason"]}]},
+        ensure_ascii=False)+"\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    try: req=await request.json()
+    except Exception:
+        return JSONResponse(status_code=400,content={"error":{"type":"invalid_request_error","message":"Request body is not valid JSON."}})
+    if not isinstance(req,dict) or not req.get("messages"):
+        return JSONResponse(status_code=400,content={"error":{"type":"invalid_request_error","message":"Missing required field: messages."}})
+    anth_req=_openai_to_anthropic(req); payload=build_upstream_payload(anth_req,CONFIG["features"]); payload.pop("_breakdown",None)
+    try: status,upstream=await resolve_server_tools(payload,CONFIG["features"])
+    except Exception as e:
+        return JSONResponse(status_code=503,content={"error":{"type":"api_error","message":str(e)}})
+    if status>=400:
+        msg=(upstream.get("error",{}) or {}).get("message",str(upstream)) if isinstance(upstream,dict) else str(upstream)
+        return JSONResponse(status_code=status,content={"error":{"type":"api_error","message":msg[:500]}})
+    message=process_upstream_message(upstream,anth_req,CONFIG["features"])
+    if req.get("stream"):
+        return StreamingResponse(_openai_stream(message,req.get("model") or CONFIG["model"]),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return JSONResponse(content=_anthropic_to_openai(message,req.get("model") or CONFIG["model"]))
+
+
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     try:
@@ -2465,7 +2683,7 @@ async def count_tokens(request: Request):
 @app.get("/v1/models")
 async def models():
     url = CONFIG["upstream_base_url"].rstrip("/") + "/models"
-    headers = {"x-api-key": CONFIG["api_key"], "anthropic-version": "2023-06-01"}
+    headers = _upstream_auth_headers(CONFIG.get("api_key", ""), json_body=False)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(url, headers=headers)
@@ -2509,7 +2727,7 @@ async def set_admin_config(request: Request):
         feats = body.get("features", {})
         if isinstance(feats, dict):
             CONFIG["features"].update(feats)
-        for k in ("upstream_base_url", "model", "ui_lang", "upstream_timeout_s"):
+        for k in ("upstream_base_url", "model", "ui_lang", "upstream_timeout_s", "upstream_connect_timeout_s", "upstream_write_timeout_s", "upstream_pool_timeout_s", "max_concurrent_upstream", "retry_max_attempts", "retry_backoff_s", "circuit_breaker_failures", "circuit_breaker_cooldown_s"):
             if k in body and body[k] is not None:
                 CONFIG[k] = body[k]
         # only overwrite api key if a non-masked value is provided

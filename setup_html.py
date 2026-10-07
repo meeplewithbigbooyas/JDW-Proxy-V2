@@ -83,6 +83,17 @@ SETUP_HTML = r"""<!DOCTYPE html>
   .spin{display:inline-block;width:14px;height:14px;border:2px solid #ffffff55;
     border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:7px}
   @keyframes sp{to{transform:rotate(360deg)}}
+
+  body{background:radial-gradient(circle at 20% 0%,#17233b 0,#0b0f16 45%,#070a0f 100%);min-height:100vh}
+  header{background:rgba(14,19,29,.82);backdrop-filter:blur(18px);position:sticky;top:0;z-index:10;box-shadow:0 8px 30px #0004}
+  .card{background:rgba(20,27,39,.8);backdrop-filter:blur(14px);border-color:#ffffff14;box-shadow:0 14px 38px #0003}
+  ul.clients li{background:#0d1420;border-color:#ffffff12;padding:13px 14px;transition:.18s;box-shadow:inset 0 1px #ffffff05}
+  ul.clients li:hover{transform:translateY(-1px);border-color:#4493f866}
+  ul.clients li.sel{background:linear-gradient(135deg,#12301f,#10221a);border-color:#2ea04388}
+  .endpoint{background:linear-gradient(135deg,#0d1828,#101621);border-color:#4493f833}
+  input[type=text]{background:#0d1420;border-color:#ffffff18}
+  input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px #4493f81c}
+  .badge{box-shadow:0 0 18px #4493f82e}
 </style>
 </head>
 <body>
@@ -96,7 +107,7 @@ SETUP_HTML = r"""<!DOCTYPE html>
 
 <main>
   <div class="card">
-    <p class="intro" data-i="welcome">Welcome to JDW Proxy. Let's connect your AI clients to the proxy.</p>
+    <div style="font-size:11px;color:var(--accent);letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px">Local gateway</div><p class="intro" data-i="welcome">Welcome to JDW Proxy. Let's connect your AI clients to the proxy.</p>
     <p class="intro muted" data-i="welcome2">The proxy will automatically find each selected client's configuration file and add a <b>JDW</b> provider pointing at this local proxy.</p>
     <div class="selfield"><span data-i="endpointLbl">Clients will be pointed at this endpoint:</span></div>
     <div class="endpoint" id="endpointUrl">http://127.0.0.1:8181/v1</div>

@@ -466,6 +466,73 @@ def patch_deepseek_harness(base_url: str, model: str, api_key: str) -> Dict[str,
     return _result(ok, path, note=(note + " | " + cred_note), needs_admin=needs)
 
 
+# ---- Continue --------------------------------------------------------------
+
+def patch_continue(base_url: str, model: str, api_key: str) -> Dict[str, Any]:
+    """Best-effort Continue desktop/VS Code config patch.
+    Supports the current YAML config layout and preserves existing models."""
+    if yaml is None:
+        return _result(False, _p(HOME, ".continue", "config.yaml"), note="PyYAML not installed")
+    base = _p(HOME, ".continue")
+    path = _p(base, "config.yaml")
+    if not os.path.isfile(path):
+        return _result(False, path, note="Continue config.yaml not found")
+    try:
+        data = yaml.safe_load(_read_text(path)) or {}
+        if not isinstance(data, dict):
+            data = {}
+        models = data.setdefault("models", [])
+        if not isinstance(models, list):
+            models = []
+            data["models"] = models
+        models = [m for m in models if not (isinstance(m, dict) and m.get("name") == PROVIDER_DISPLAY)]
+        entry = {
+            "name": PROVIDER_DISPLAY,
+            "provider": "anthropic",
+            "model": model,
+            "apiBase": base_url.rstrip("/"),
+            "apiKey": api_key or "${" + API_KEY_ENV + "}",
+        }
+        models.insert(0, entry)
+        data["models"] = models
+        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
+    except Exception as e:
+        return _result(False, path, note=f"parse/serialize failed: {e}")
+    ok, needs, note = _write_guarded(path, text)
+    return _result(ok, path, note=note, needs_admin=needs)
+
+
+# ---- Aider -----------------------------------------------------------------
+
+def patch_aider(base_url: str, model: str, api_key: str) -> Dict[str, Any]:
+    """Patch Aider's YAML config. Aider accepts api-base/api-key via config."""
+    path = _p(HOME, ".aider.conf.yml")
+    try:
+        data = yaml.safe_load(_read_text(path)) if (yaml and os.path.isfile(path)) else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["openai-api-base"] = base_url.rstrip("/")
+        data["model"] = model
+        if api_key:
+            data["api-key"] = "anthropic=" + api_key
+        else:
+            data["api-key"] = "anthropic=${" + API_KEY_ENV + "}"
+        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False) if yaml else json.dumps(data, indent=2)
+    except Exception as e:
+        return _result(False, path, note=f"parse/serialize failed: {e}")
+    ok, needs, note = _write_guarded(path, text)
+    return _result(ok, path, note=note + f" | set {API_KEY_ENV} in your environment", needs_admin=needs)
+
+
+def _continue_detect() -> bool:
+    return os.path.isfile(_p(HOME, ".continue", "config.yaml")) or os.path.isdir(_p(HOME, ".continue"))
+
+
+def _aider_detect() -> bool:
+    return (os.path.isfile(_p(HOME, ".aider.conf.yml"))
+            or shutil.which("aider") is not None)
+
+
 # --------------------------------------------------------------------------- #
 # Client registry
 # --------------------------------------------------------------------------- #
@@ -520,6 +587,14 @@ CLIENTS: List[Dict[str, Any]] = [
      "detect": _dsh_detect, "patch": patch_deepseek_harness,
      "config_hint": "~/.dsh/profiles/desktop/cordis.patch.yml",
      "inline_key": False},
+    {"key": "continue", "name": "Continue",
+     "detect": _continue_detect, "patch": patch_continue,
+     "config_hint": "~/.continue/config.yaml",
+     "inline_key": True},
+    {"key": "aider", "name": "Aider",
+     "detect": _aider_detect, "patch": patch_aider,
+     "config_hint": "~/.aider.conf.yml",
+     "inline_key": True},
 ]
 
 
