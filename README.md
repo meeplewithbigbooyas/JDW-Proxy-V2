@@ -1,6 +1,65 @@
-# JDW Fix Proxy
+# JDW Fix Proxy — V2
 
-## Tools
+An Anthropic-compatible (`/v1/messages`) reverse proxy that repairs the broken
+JustDoWork (JDW) upstream relay, plus a bilingual (EN/RU) web dashboard.
+
+## What's new in V2 — First-launch client setup
+
+On the **first launch** the proxy opens your browser to a setup wizard
+(`/setup`). It:
+
+1. Lists the supported AI clients, **numbered**, with live "installed /
+   not found" detection:
+   1. Claude Code
+   2. Claude Desktop
+   3. ChatGPT Codex
+   4. OpenCode
+   5. DeepSeek Harness
+2. Lets you pick several at once — click them, or type their numbers with no
+   spaces (e.g. `134` = clients 1, 3 and 4).
+3. **Automatically finds each selected client's config file and edits it** to
+   add a `jdw` provider pointing at this local proxy (base URL, endpoint
+   format / wire API, model). Every file is backed up first
+   (`*.jdw-bak-<timestamp>`), and existing settings are preserved.
+4. If a config file needs elevated rights, offers a **"Retry as
+   administrator"** button (Windows UAC prompt).
+5. Clearly **warns you that you must supply your own JDW API key** — the setup
+   wires the clients to the proxy but never invents a key for you. For clients
+   that read the key from an environment variable it uses `JDW_API_KEY`
+   (`JDW_PROXY_API_KEY` for DeepSeek Harness).
+
+After setup (or "Skip for now") the flag `setup_completed` is written to
+`config.json`; later launches open the dashboard (`/`) directly.
+
+To re-run the wizard any time, open `http://127.0.0.1:8181/setup`, or set
+`"setup_completed": false` in `config.json`.
+
+Disable the automatic browser pop with the env var `JDW_NO_BROWSER=1`.
+
+### Where each client is configured
+
+| # | Client           | File                                         | Mechanism                               |
+|---|------------------|----------------------------------------------|-----------------------------------------|
+| 1 | Claude Code      | `~/.claude/settings.json`                    | `env.ANTHROPIC_BASE_URL` + token + model|
+| 2 | Claude Desktop   | `%APPDATA%/Claude/claude_desktop_config.json`| endpoint stored (no native provider UI) |
+| 3 | ChatGPT Codex    | `~/.codex/config.toml`                        | `[model_providers.jdw]` + default        |
+| 4 | OpenCode         | `~/.config/opencode/opencode.jsonc`          | `provider.jdw` (`@ai-sdk/anthropic`)    |
+| 5 | DeepSeek Harness | `~/.dsh/profiles/desktop/cordis.patch.yml`   | `llm-pi-ai` provider + default model    |
+
+## Run
+
+```
+pip install -r requirements.txt
+python jdw_proxy.py
+```
+
+## URLs
+
+- Dashboard: http://127.0.0.1:8181/
+- First-launch setup: http://127.0.0.1:8181/setup
+- Anthropic endpoint: http://127.0.0.1:8181/v1
+
+## Dashboard tools
 
 - `pwsh`
 - `fetch_image`
@@ -9,7 +68,3 @@
 - `edit`
 - `grep`
 - `glob`
-
-## URL
-
-http://127.0.0.1:8181/

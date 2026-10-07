@@ -95,16 +95,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # whatever max_tokens the client sent (clamped to this value), capping
         # generation cost. 0 = OFF (honour the client's requested max_tokens).
         "max_output_tokens": 0,
-        # --- Server-side image tool (executed BY the proxy, not the client) ---
-        # When on, the proxy injects a fetch_image tool, fetches the image URL
-        # itself, and feeds the image back to the model as a proper image block,
-        # looping until the model gives a final answer. Web search / page fetch
-        # have been removed; only image fetching remains.
+        # SAFETY FLOOR for the upstream max_tokens budget. If a client asks for a
+        # small max_tokens, the model can get cut off MID tool_call (the fenced
+        # JSON is left unterminated -> can't be parsed into a tool_use, so the
+        # call silently "stops half way"). We never send upstream less than this,
+        # so long tool calls (e.g. system_todo_write) have room to finish. Our
+        # own enforce_max_tokens step still trims pure-text replies afterwards.
+        "min_tool_output_tokens": 8192,
+        # --- Server-side tools (executed BY the proxy, not the client) ---
+        # When on, the proxy injects its own tools (image fetch + internet
+        # access), runs them itself, and feeds the results back to the model,
+        # looping until the model gives a final answer. This is the master
+        # switch; the three sub-flags below toggle each capability.
         "web_tools_enabled": True,
+        # fetch_image: download an image URL (or scrape the image out of an
+        # HTML share page) and hand it to the model as a real image block.
+        "image_fetch_enabled": True,
+        # web_search: query the web (DuckDuckGo HTML endpoint, no API key) and
+        # return the top result titles + snippets + links.
+        "web_search_enabled": True,
+        # fetch_url: open an http(s) page and return its readable text content
+        # (HTML stripped) so the model can read docs / articles / raw files.
+        "web_fetch_enabled": True,
         # Max server-side tool round-trips per request (safety against loops).
         "web_tools_max_iters": 4,
     },
     "ui_lang": "en",
+    # First-launch client setup wizard. When False, launching the proxy opens
+    # the browser straight to the /setup page that configures AI clients.
+    "setup_completed": False,
 }
 
 _config_lock = threading.RLock()
@@ -134,6 +153,14 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 
 CONFIG = load_config()
+
+# Opt-in debug: when JDW_DEBUG_TOOL_LEAK=1 the proxy scans the FINAL content it
+# is about to return and logs a `tool_leak` event if a raw tool-call (an
+# un-parsed ```tool_call fence, native <invoke> XML, or a truncated
+# {"name": ...} object) leaked into a plain text block instead of becoming a
+# real tool_use. This never alters the response -- it only records evidence so
+# a real occurrence of the "raw tool_call shows up as text" bug can be caught.
+DEBUG_TOOL_LEAK = os.environ.get("JDW_DEBUG_TOOL_LEAK") == "1"
 
 
 # --------------------------------------------------------------------------- #
@@ -642,9 +669,22 @@ def flatten_content_blocks(content: Any, role: str,
     return "\n\n".join(p for p in parts if p != "")
 
 
+def _block_has_image(b: Any) -> bool:
+    """True if a single content block is an image, or a tool_result that carries
+    one or more nested image blocks."""
+    if not isinstance(b, dict):
+        return False
+    if b.get("type") == "image":
+        return True
+    if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+        return any(isinstance(ib, dict) and ib.get("type") == "image"
+                   for ib in b["content"])
+    return False
+
+
 def message_has_image(content: Any) -> bool:
     if isinstance(content, list):
-        return any(isinstance(b, dict) and b.get("type") == "image" for b in content)
+        return any(_block_has_image(b) for b in content)
     return False
 
 
@@ -671,6 +711,29 @@ def flatten_messages(messages: List[Dict[str, Any]],
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "image":
                     new_blocks.append(b)
+                elif isinstance(b, dict) and b.get("type") == "tool_result" \
+                        and _block_has_image(b):
+                    # Split a tool_result that carries image(s): keep the text
+                    # part as a flattened text block, then pass the image
+                    # block(s) through untouched so the model actually sees
+                    # them (previously they were dropped as the literal
+                    # string "[image]").
+                    inner = b.get("content") or []
+                    text_parts = []
+                    image_blocks = []
+                    for ib in inner:
+                        if isinstance(ib, dict) and ib.get("type") == "image":
+                            image_blocks.append(ib)
+                        elif isinstance(ib, dict) and ib.get("type") == "text":
+                            text_parts.append(ib.get("text", ""))
+                        else:
+                            text_parts.append(str(ib))
+                    tcid = b.get("tool_use_id", "")
+                    tag = "TOOL ERROR" if b.get("is_error") else "TOOL RESULT"
+                    head = "\n".join(p for p in text_parts if p)
+                    label = f"[{tag} for {tcid}]" + (f"\n{head}" if head else "")
+                    new_blocks.append({"type": "text", "text": label})
+                    new_blocks.extend(image_blocks)
                 else:
                     txt = flatten_content_blocks([b], role, max_tool_result_chars)
                     if txt:
@@ -884,6 +947,50 @@ def parse_tool_calls_from_text(text: str,
 
 
 # --------------------------------------------------------------------------- #
+# Debug: detect a raw tool_call that leaked into a final TEXT block
+# --------------------------------------------------------------------------- #
+
+# A truncated/!unparsed tool call sitting in plain text looks like one of:
+#   * a ```tool_call (or ```json {"name": ...}) fence
+#   * native <invoke name="..."> / <invoke ...> XML
+#   * a bare {"name": "...", "input": ...} object (possibly cut off)
+_LEAK_FENCE_RE = re.compile(r"```[A-Za-z0-9_+.\-]*[ \t]*\r?\n\s*\{\s*\"name\"",
+                            re.IGNORECASE)
+_LEAK_INVOKE_RE = re.compile(r"<(?:antml:)?invoke\s+name\s*=", re.IGNORECASE)
+_LEAK_BARE_RE = re.compile(r"\{\s*\"name\"\s*:\s*\"[^\"]+\"")
+
+
+def detect_tool_leak(content_out: List[Dict[str, Any]]) -> None:
+    """Log a `tool_leak` event if a raw tool-call pattern survived into a final
+    text block. Diagnostic only -- does not modify the content. Gated by the
+    JDW_DEBUG_TOOL_LEAK env flag at the call site."""
+    for b in content_out:
+        if not isinstance(b, dict) or b.get("type") != "text":
+            continue
+        txt = b.get("text") or ""
+        if not txt:
+            continue
+        kind = None
+        if _LEAK_FENCE_RE.search(txt):
+            kind = "fence"
+        elif _LEAK_INVOKE_RE.search(txt):
+            kind = "invoke_xml"
+        elif _LEAK_BARE_RE.search(txt):
+            kind = "bare_json"
+        if kind:
+            idx = txt.find("```")
+            if idx < 0:
+                idx = txt.find("<")
+            if idx < 0:
+                idx = txt.find("{")
+            snip = txt[max(0, idx - 40):idx + 400] if idx >= 0 else txt[:400]
+            log_event({"tool_leak": True, "kind": kind,
+                       "text_len": len(txt),
+                       "snippet": snip,
+                       "note": "raw tool_call leaked into final text block"})
+
+
+# --------------------------------------------------------------------------- #
 # Post-processing of the upstream non-stream response
 # --------------------------------------------------------------------------- #
 
@@ -1000,6 +1107,10 @@ def process_upstream_message(upstream: Dict[str, Any],
     if not content_out:
         content_out = [{"type": "text", "text": ""}]
 
+    # DEBUG (opt-in): catch a raw tool_call that leaked into a text block.
+    if DEBUG_TOOL_LEAK:
+        detect_tool_leak(content_out)
+
     # 4) determine stop_reason
     has_tool_use = any(b.get("type") == "tool_use" for b in content_out)
     stop_reason = "end_turn"
@@ -1068,18 +1179,60 @@ def process_upstream_message(upstream: Dict[str, Any],
 # --------------------------------------------------------------------------- #
 
 # Tool schemas injected into the system prompt (same shape as a client tool).
+# Each entry carries a private "_feature" key naming the config flag that
+# enables it, so build_upstream_payload can inject only the ones turned on.
+# (The key is stripped before the schema is rendered into the prompt.)
 SERVER_WEB_TOOLS: List[Dict[str, Any]] = [
     {
+        "_feature": "image_fetch_enabled",
         "name": "fetch_image",
         "description": (
             "Fetch an image by URL so you can SEE and analyse it. Returns the "
             "image to you directly. Use to describe, read, or reason about an "
-            "image available online."
+            "image available online. The URL may point straight at an image "
+            "file OR at an HTML page that displays/shares one (e.g. a share "
+            "link) -- in the latter case the proxy finds the image for you."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Absolute http(s) URL of the image."},
+                "url": {"type": "string", "description": "Absolute http(s) URL of the image or the page showing it."},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "_feature": "web_search_enabled",
+        "name": "web_search",
+        "description": (
+            "Search the web for current, up-to-date information and get back a "
+            "ranked list of result titles, snippets and links. Use this when "
+            "you need facts you don't know, recent events, or to find a page "
+            "to open with fetch_url."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query."},
+                "max_results": {"type": "integer", "description": "How many results to return (default 5, max 10)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "_feature": "web_fetch_enabled",
+        "name": "fetch_url",
+        "description": (
+            "Open an http(s) URL and return its readable page content as plain "
+            "text (HTML tags/scripts stripped). Use to read docs, articles, API "
+            "responses or a raw file off the web, e.g. a link returned by "
+            "web_search."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Absolute http(s) URL of the page to read."},
+                "max_chars": {"type": "integer", "description": "Truncate the returned text to this many characters (default 6000)."},
             },
             "required": ["url"],
         },
@@ -1101,11 +1254,101 @@ _IMAGE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
 }
 
-# [web search helpers removed: only image fetching remains]
+# Browser-like headers for ordinary web pages (search + fetch_url). A real
+# desktop User-Agent avoids the trivial bot blocks many sites apply to the
+# default httpx UA.
+_WEB_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+}
+
+_IMG_CTYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+
+def _ctype_from_ext(url: str) -> Optional[str]:
+    """Best-effort image media-type from a URL's file extension."""
+    low = url.lower().split("?", 1)[0]
+    if low.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if low.endswith(".png"):
+        return "image/png"
+    if low.endswith(".gif"):
+        return "image/gif"
+    if low.endswith(".webp"):
+        return "image/webp"
+    return None
+
+
+# <meta property="og:image" content="..."> (either attribute order) and <img src>
+_OG_IMAGE_RE = re.compile(
+    r"""<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["'][^>]*>""",
+    re.IGNORECASE,
+)
+_CONTENT_ATTR_RE = re.compile(r"""content\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_IMG_SRC_RE = re.compile(r"""<img[^>]+src\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _scrape_image_url(html: str, base_url: str) -> Optional[str]:
+    """Find the best image URL inside an HTML page: prefer og:image/twitter:image
+    (what share pages expose), else the first <img src>. Relative URLs are
+    resolved against base_url."""
+    candidate: Optional[str] = None
+    m = _OG_IMAGE_RE.search(html)
+    if m:
+        cm = _CONTENT_ATTR_RE.search(m.group(0))
+        if cm:
+            candidate = cm.group(1).strip()
+    if not candidate:
+        im = _IMG_SRC_RE.search(html)
+        if im:
+            candidate = im.group(1).strip()
+    if not candidate:
+        return None
+    candidate = _html.unescape(candidate)
+    # resolve protocol-relative and root/relative URLs
+    if candidate.startswith("//"):
+        scheme = urlparse(base_url).scheme or "https"
+        return f"{scheme}:{candidate}"
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        return candidate
+    pr = urlparse(base_url)
+    if candidate.startswith("/"):
+        return f"{pr.scheme}://{pr.netloc}{candidate}"
+    base_dir = pr.path.rsplit("/", 1)[0]
+    return f"{pr.scheme}://{pr.netloc}{base_dir}/{candidate}"
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>",
+                              re.IGNORECASE | re.DOTALL)
+_WS_RE = re.compile(r"[ \t\r\f]+")
+_BLANKLINES_RE = re.compile(r"\n\s*\n\s*\n+")
+
+
+def _html_to_text(html: str) -> str:
+    """Strip an HTML document down to readable plain text."""
+    txt = _SCRIPT_STYLE_RE.sub(" ", html)
+    # turn block-level tags into newlines so structure survives
+    txt = re.sub(r"<\s*(br|/p|/div|/li|/h[1-6]|/tr)\s*/?>", "\n", txt,
+                 flags=re.IGNORECASE)
+    txt = _TAG_RE.sub(" ", txt)
+    txt = _html.unescape(txt)
+    txt = _WS_RE.sub(" ", txt)
+    txt = _BLANKLINES_RE.sub("\n\n", txt)
+    return txt.strip()
 
 
 async def _fetch_image_block(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
-    """Fetch an image and return an Anthropic image content block (base64)."""
+    """Fetch an image and return an Anthropic image content block (base64).
+
+    If the URL turns out to be an HTML page (a share/landing page rather than a
+    direct image file), scrape its og:image / <img> and fetch THAT instead, so
+    links like image-host share pages work transparently.
+    """
     # Build image-appropriate headers, adding a same-origin Referer which some
     # CDNs (Wikimedia, etc.) require before they serve the bytes.
     hdrs = dict(_IMAGE_HEADERS)
@@ -1122,24 +1365,130 @@ async def _fetch_image_block(client: httpx.AsyncClient, url: str) -> Dict[str, A
     if r.status_code >= 400:
         return {"_error": f"fetch_image HTTP {r.status_code} for {url}"}
     ctype = (r.headers.get("content-type", "") or "").split(";")[0].strip().lower()
-    if ctype not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-        # best-effort guess from extension
-        low = url.lower()
-        if low.endswith((".jpg", ".jpeg")):
-            ctype = "image/jpeg"
-        elif low.endswith(".png"):
-            ctype = "image/png"
-        elif low.endswith(".gif"):
-            ctype = "image/gif"
-        elif low.endswith(".webp"):
-            ctype = "image/webp"
-        else:
-            return {"_error": f"fetch_image: unsupported content-type '{ctype}'"}
+    if ctype not in _IMG_CTYPES:
+        ctype = _ctype_from_ext(url) or ctype
+    # Not a direct image -> if it's an HTML page, scrape an image URL out of it
+    # and fetch that (one hop only, to avoid loops).
+    if ctype not in _IMG_CTYPES:
+        looks_html = ("text/html" in ctype or "application/xhtml" in ctype
+                      or r.content[:200].lstrip().lower().startswith(b"<!doctype html")
+                      or b"<html" in r.content[:500].lower())
+        if looks_html:
+            try:
+                page = r.content.decode(r.encoding or "utf-8", "replace")
+            except Exception:
+                page = r.text
+            img_url = _scrape_image_url(page, str(r.url))
+            if not img_url:
+                return {"_error": f"fetch_image: no image found on page {url}"}
+            try:
+                r2 = await client.get(img_url, headers=hdrs, follow_redirects=True)
+            except Exception as e:
+                return {"_error": f"fetch_image error following page image: {e}"}
+            if r2.status_code >= 400:
+                return {"_error": f"fetch_image HTTP {r2.status_code} for {img_url}"}
+            ctype = (r2.headers.get("content-type", "") or "").split(";")[0].strip().lower()
+            if ctype not in _IMG_CTYPES:
+                ctype = _ctype_from_ext(img_url) or ""
+            if ctype not in _IMG_CTYPES:
+                return {"_error": f"fetch_image: page image had unsupported type '{ctype}'"}
+            b64 = base64.b64encode(r2.content).decode("ascii")
+            return {"type": "image",
+                    "source": {"type": "base64", "media_type": ctype, "data": b64},
+                    "_resolved_url": img_url}
+        return {"_error": f"fetch_image: unsupported content-type '{ctype}'"}
     b64 = base64.b64encode(r.content).decode("ascii")
     return {
         "type": "image",
         "source": {"type": "base64", "media_type": ctype, "data": b64},
     }
+
+
+# DuckDuckGo's HTML endpoint needs no API key. Results are plain anchor tags
+# with class "result__a" (title+link) and "result__snippet" (snippet).
+_DDG_RESULT_RE = re.compile(
+    r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_DDG_SNIPPET_RE = re.compile(
+    r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _ddg_clean_link(href: str) -> str:
+    """DuckDuckGo wraps result links as /l/?uddg=<encoded>. Unwrap to the real
+    target URL when present."""
+    try:
+        if "uddg=" in href:
+            qs = parse_qs(urlparse(href).query)
+            if qs.get("uddg"):
+                return unquote(qs["uddg"][0])
+    except Exception:
+        pass
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+async def _web_search(client: httpx.AsyncClient, query: str,
+                      max_results: int = 5) -> str:
+    """Run a DuckDuckGo HTML search and return a compact, numbered text list of
+    title / link / snippet triples the model can read and cite."""
+    max_results = max(1, min(int(max_results or 5), 10))
+    try:
+        r = await client.post(
+            "https://html.duckduckgo.com/html/",
+            headers=_WEB_HEADERS,
+            data={"q": query},
+            follow_redirects=True,
+        )
+    except Exception as e:
+        return f"[web_search error: {e}]"
+    if r.status_code >= 400:
+        return f"[web_search HTTP {r.status_code}]"
+    html = r.text
+    titles = _DDG_RESULT_RE.findall(html)
+    snippets = _DDG_SNIPPET_RE.findall(html)
+    if not titles:
+        return f"[web_search: no results for '{query}']"
+    lines = [f"Search results for: {query}\n"]
+    for i, (href, title_html) in enumerate(titles[:max_results]):
+        title = _html.unescape(_TAG_RE.sub("", title_html)).strip()
+        link = _ddg_clean_link(href)
+        snip = ""
+        if i < len(snippets):
+            snip = _html.unescape(_TAG_RE.sub("", snippets[i])).strip()
+        lines.append(f"{i + 1}. {title}\n   {link}")
+        if snip:
+            lines.append(f"   {snip}")
+    return "\n".join(lines)
+
+
+async def _fetch_url_text(client: httpx.AsyncClient, url: str,
+                          max_chars: int = 6000) -> str:
+    """Fetch a page and return its readable text (HTML stripped), truncated."""
+    max_chars = max(500, min(int(max_chars or 6000), 50000))
+    try:
+        r = await client.get(url, headers=_WEB_HEADERS, follow_redirects=True)
+    except Exception as e:
+        return f"[fetch_url error: {e}]"
+    if r.status_code >= 400:
+        return f"[fetch_url HTTP {r.status_code} for {url}]"
+    ctype = (r.headers.get("content-type", "") or "").split(";")[0].strip().lower()
+    if ctype and not (ctype.startswith("text/") or "html" in ctype
+                      or "xml" in ctype or "json" in ctype
+                      or "javascript" in ctype):
+        return f"[fetch_url: non-text content-type '{ctype}' at {url}]"
+    body = r.text
+    if "html" in ctype or "<html" in body[:500].lower():
+        text = _html_to_text(body)
+    else:
+        text = body
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n...[truncated at {max_chars} chars]"
+    return f"Content of {url}:\n\n{text}" if text else f"[fetch_url: empty page at {url}]"
 
 
 async def run_server_web_tool(client: httpx.AsyncClient,
@@ -1157,10 +1506,27 @@ async def run_server_web_tool(client: httpx.AsyncClient,
         block = await _fetch_image_block(client, url)
         if block.get("_error"):
             return {"text": "[" + block["_error"] + "]"}
+        resolved = block.pop("_resolved_url", None)
+        caption = (f"Fetched image from {resolved} (found on page {url}):"
+                   if resolved else f"Fetched image from {url}:")
         return {"blocks": [
-            {"type": "text", "text": f"Fetched image from {url}:"},
+            {"type": "text", "text": caption},
             block,
         ]}
+    if name == "web_search":
+        query = (tool_input.get("query") or "").strip()
+        if not query:
+            return {"text": "[web_search: empty query]"}
+        text = await _web_search(client, query,
+                                 tool_input.get("max_results", 5))
+        return {"text": text}
+    if name == "fetch_url":
+        url = (tool_input.get("url") or "").strip()
+        if not url:
+            return {"text": "[fetch_url: empty url]"}
+        text = await _fetch_url_text(client, url,
+                                     tool_input.get("max_chars", 6000))
+        return {"text": text}
     return {"text": f"[unknown server tool: {name}]"}
 
 
@@ -1269,11 +1635,18 @@ def build_upstream_payload(client_req: Dict[str, Any],
                 inject_tools = only
         elif web_on:
             # Append our server tools, skipping any the client already defines
-            # under the same name (client definition wins).
+            # under the same name (client definition wins) and any whose
+            # per-feature flag is turned off. The private "_feature" key is
+            # stripped so it never leaks into the rendered prompt.
             client_names = {t.get("name") for t in tools}
             for st in SERVER_WEB_TOOLS:
-                if st["name"] not in client_names:
-                    inject_tools.append(st)
+                if st["name"] in client_names:
+                    continue
+                flag = st.get("_feature")
+                if flag and not feats.get(flag, True):
+                    continue
+                inject_tools.append({k: v for k, v in st.items()
+                                     if k != "_feature"})
         addendum = build_tool_system_block(
             inject_tools, tool_choice,
             compact=feats.get("compact_tool_schemas", True),
@@ -1319,7 +1692,8 @@ def build_upstream_payload(client_req: Dict[str, Any],
     # raise the upstream budget to a safe floor so tool calls always complete;
     # our own enforce_max_tokens step still trims pure-text replies afterwards.
     _client_max = client_req.get("max_tokens", 4096) or 4096
-    _upstream_max = _client_max if _client_max >= 4096 else 4096
+    _floor = int(feats.get("min_tool_output_tokens", 8192) or 0)
+    _upstream_max = _client_max if _client_max >= _floor else _floor
     # Admin hard cap on OUTPUT tokens. When set (>0) it OVERRIDES the client's
     # request and clamps generation to this value, capping cost per turn.
     _hard_cap = int(feats.get("max_output_tokens", 0) or 0)
@@ -2043,20 +2417,154 @@ async def dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
-# Dashboard HTML is defined in a separate constant appended below.
+# --------------------------------------------------------------------------- #
+# First-launch client setup wizard
+# --------------------------------------------------------------------------- #
+
+import jdw_setup  # noqa: E402
+
+
+def _proxy_base_url() -> str:
+    """The Anthropic base URL clients should point at (this proxy)."""
+    host = CONFIG.get("listen_host", "127.0.0.1")
+    # Clients can't reach 0.0.0.0; advertise loopback instead.
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    port = int(CONFIG.get("listen_port", 8181))
+    return f"http://{host}:{port}/v1"
+
+
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_page():
+    return HTMLResponse(content=SETUP_HTML)
+
+
+@app.get("/setup/clients")
+async def setup_clients():
+    """Return the numbered client list with live install detection + the
+    endpoint/model/key-env the proxy will write into each client."""
+    return JSONResponse(content={
+        "clients": jdw_setup.list_clients(),
+        "base_url": _proxy_base_url(),
+        "model": CONFIG.get("model", "claude-opus-4-8"),
+        "api_key_env": jdw_setup.API_KEY_ENV,
+        "setup_completed": bool(CONFIG.get("setup_completed")),
+    })
+
+
+@app.post("/setup/apply")
+async def setup_apply(request: Request):
+    """Patch the selected clients' config files to use the JDW proxy.
+
+    Body: {"selection": "134" | [1,3,4], "write_key": false,
+           "api_key": "<optional inline key>"}
+    By default we do NOT write the key (the user supplies it themselves); if
+    write_key is true and the stored proxy key is available we pass it through
+    to clients whose format needs an inline key.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return anthropic_error(400, "invalid_request_error", "Body is not valid JSON.")
+    selection = body.get("selection")
+    if selection in (None, "", []):
+        return anthropic_error(400, "invalid_request_error", "No clients selected.")
+    api_key = ""
+    if body.get("write_key"):
+        api_key = (body.get("api_key") or CONFIG.get("api_key") or "").strip()
+    report = jdw_setup.apply_clients(
+        selection, _proxy_base_url(), CONFIG.get("model", "claude-opus-4-8"), api_key)
+    # Mark setup as completed as soon as at least one client was processed.
+    if report.get("results"):
+        with _config_lock:
+            CONFIG["setup_completed"] = True
+            save_config(CONFIG)
+    return JSONResponse(content=report)
+
+
+@app.post("/setup/elevate")
+async def setup_elevate(request: Request):
+    """Retry the selected clients with administrator rights (UAC prompt).
+    Used when a plain apply returned needs_admin for a client."""
+    try:
+        body = await request.json()
+    except Exception:
+        return anthropic_error(400, "invalid_request_error", "Body is not valid JSON.")
+    selection = body.get("selection")
+    if selection in (None, "", []):
+        return anthropic_error(400, "invalid_request_error", "No clients selected.")
+    api_key = ""
+    if body.get("write_key"):
+        api_key = (body.get("api_key") or CONFIG.get("api_key") or "").strip()
+    # Elevation blocks on a UAC prompt + child process; run it off the loop.
+    report = await asyncio.to_thread(
+        jdw_setup.run_elevated_apply, selection, _proxy_base_url(),
+        CONFIG.get("model", "claude-opus-4-8"), api_key)
+    if report.get("results"):
+        with _config_lock:
+            CONFIG["setup_completed"] = True
+            save_config(CONFIG)
+    return JSONResponse(content=report)
+
+
+@app.post("/setup/skip")
+async def setup_skip():
+    """Mark the first-launch wizard as done without configuring any client."""
+    with _config_lock:
+        CONFIG["setup_completed"] = True
+        save_config(CONFIG)
+    return JSONResponse(content={"ok": True})
+
+
+# Dashboard + setup HTML are defined in a separate module and appended below.
 from dashboard_html import DASHBOARD_HTML  # noqa: E402
+from setup_html import SETUP_HTML  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
 
+def _open_browser_when_ready(url: str, host: str, port: int) -> None:
+    """Wait until the HTTP server accepts connections, then open the default
+    browser once. Runs in a background thread so it never blocks startup."""
+    import socket
+    import webbrowser
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((probe_host, port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.25)
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        print(f"[setup] could not open browser automatically: {e}")
+        print(f"[setup] open this URL manually: {url}")
+
+
 if __name__ == "__main__":
     import uvicorn
     host = CONFIG.get("listen_host", "127.0.0.1")
     port = int(CONFIG.get("listen_port", 8181))
-    print(f"JDW Fix Proxy listening on http://{host}:{port}")
-    print(f"  Anthropic endpoint : http://{host}:{port}/v1")
-    print(f"  Dashboard          : http://{host}:{port}/")
+    disp_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    first_launch = not bool(CONFIG.get("setup_completed"))
+    landing = "/setup" if first_launch else "/"
+    url = f"http://{disp_host}:{port}{landing}"
+
+    print(f"JDW Proxy V2 listening on http://{host}:{port}")
+    print(f"  Anthropic endpoint : http://{disp_host}:{port}/v1")
+    print(f"  Dashboard          : http://{disp_host}:{port}/")
+    if first_launch:
+        print(f"  First-launch setup : {url}")
     print(f"  Upstream           : {CONFIG['upstream_base_url']}")
+
+    # Open the browser automatically: the setup wizard on first launch, or the
+    # dashboard on subsequent launches. Disable with JDW_NO_BROWSER=1.
+    if os.environ.get("JDW_NO_BROWSER") != "1":
+        threading.Thread(target=_open_browser_when_ready,
+                         args=(url, host, port), daemon=True).start()
+
     uvicorn.run(app, host=host, port=port, log_level="info")

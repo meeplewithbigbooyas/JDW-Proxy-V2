@@ -22,8 +22,13 @@
     "max_history_messages": 60,
     "max_tool_result_chars": 0,
     "max_output_tokens": 0,
+    "min_tool_output_tokens": 8192,
     "web_tools_enabled": true,
+    "image_fetch_enabled": true,
+    "web_search_enabled": true,
+    "web_fetch_enabled": true,
     "web_tools_max_iters": 4
   },
-  "ui_lang": "en"
+  "ui_lang": "en",
+  "setup_completed": false
 }
