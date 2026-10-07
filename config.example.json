@@ -11,6 +11,7 @@
   "features": {
     "tool_injection": true,
     "strict_tool_names": true,
+    "guard_tool_examples": true,
     "flatten_tool_history": true,
     "strip_thinking": true,
     "enforce_max_tokens": true,

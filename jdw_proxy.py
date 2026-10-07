@@ -74,6 +74,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "features": {
         "tool_injection": True,
         "strict_tool_names": True,
+        # Keep a fenced/bare tool_call as TEXT when it is clearly documentation
+        # (placeholder name like '...'/'tool_name', or preceded by example cues)
+        # rather than a real call. Prevents the model's own explanations about
+        # tool calls from being truncated into a broken tool_use block.
+        "guard_tool_examples": True,
         "flatten_tool_history": True,
         "strip_thinking": True,
         "enforce_max_tokens": True,
@@ -807,9 +812,50 @@ def normalize_alternating(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 # Parse the model's text output -> real content blocks (text + tool_use)
 # --------------------------------------------------------------------------- #
 
+# Placeholder "names" the model writes when it is DOCUMENTING a tool call in
+# prose ("```tool_call {\"name\": \"...\"}") rather than actually calling one.
+# A real tool is never named any of these, so they must never become a
+# tool_use block -- doing so truncates the explanation at the fence.
+_PLACEHOLDER_TOOL_NAMES = {
+    "", "...", "name", "tool", "tool_name", "toolname", "your_tool",
+    "tool_here", "example", "example_tool", "some_tool", "the_tool",
+    "read_file",  # the literal name used in OUR OWN preamble example
+}
+_VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+
+# Prose cues that a following fence is an EXAMPLE / explanation, not a call.
+# Checked only against the short run of text immediately before the fence.
+_EXAMPLE_CUE_RE = re.compile(
+    r"(?:example|for instance|e\.g\.|looks? like|such as|like this|"
+    r"syntax|format|the preamble|documentation|illustrat|placeholder|"
+    r"пример|например|выглядит|синтаксис|формат|вид[ае])",
+    re.IGNORECASE,
+)
+
+
+def _is_plausible_tool_name(name: Optional[str]) -> bool:
+    """True only if `name` could be a REAL tool name (not a prose placeholder
+    like '...' or 'tool_name', and a syntactically valid identifier)."""
+    if not name or not isinstance(name, str):
+        return False
+    if name.strip().lower() in _PLACEHOLDER_TOOL_NAMES:
+        return False
+    return bool(_VALID_NAME_RE.match(name.strip()))
+
+
+def _looks_like_example_context(preceding_text: str) -> bool:
+    """True if the text right before a fence signals an example/explanation
+    (so the fence is documentation, not an actual tool call)."""
+    if not preceding_text:
+        return False
+    tail = preceding_text[-160:]
+    return bool(_EXAMPLE_CUE_RE.search(tail))
+
+
 def parse_tool_calls_from_text(text: str,
                                valid_names: Optional[set] = None,
-                               strict: bool = True) -> List[Dict[str, Any]]:
+                               strict: bool = True,
+                               guard_examples: bool = True) -> List[Dict[str, Any]]:
     """Split raw model text into Anthropic content blocks, converting fenced
     tool_call JSON into tool_use blocks.
 
@@ -865,6 +911,20 @@ def parse_tool_calls_from_text(text: str,
         name_ok = bool(name)
         if strict and valid_names is not None:
             name_ok = name in valid_names
+        # GUARD 1: a prose placeholder name ('...', 'tool_name', etc.) is never
+        # a real call -> keep as text. Skip this guard when the name IS a known
+        # offered tool (so a real tool that happens to collide is still called).
+        is_offered = bool(valid_names) and name in valid_names
+        if guard_examples and not is_offered and not _is_plausible_tool_name(name):
+            name_ok = False
+        # GUARD 2: the fence is preceded by example/explanation cues AND its name
+        # isn't an offered tool -> it's documentation, keep as text. A genuine
+        # call to an offered tool is never blocked by this.
+        if (guard_examples and name_ok and not is_offered
+                and _looks_like_example_context(text[last:m.start()])):
+            name_ok = False
+            log_event({"tool_example_guard": True, "name_seen": name,
+                       "note": "fence looks like a documented example -> kept as text"})
         if isinstance(parsed, dict) and name_ok:
             if pre:
                 blocks.append({"type": "text", "text": pre})
@@ -909,6 +969,12 @@ def parse_tool_calls_from_text(text: str,
             if not name:
                 continue
             if strict and valid_names is not None and name not in valid_names:
+                continue
+            # Same placeholder guard as the fenced path: a bare {"name": "..."}
+            # that is a prose placeholder is never a real call. (An offered tool
+            # name is always allowed through.)
+            is_offered = bool(valid_names) and name in valid_names
+            if guard_examples and not is_offered and not _is_plausible_tool_name(name):
                 continue
             tool_input = parsed.get("input", parsed.get("arguments", {})) if isinstance(parsed, dict) else {}
             if not isinstance(tool_input, dict):
@@ -1083,7 +1149,8 @@ def process_upstream_message(upstream: Dict[str, Any],
     strict = feats.get("strict_tool_names", True) and bool(valid_names)
     if client_has_tools:
         parsed_blocks = parse_tool_calls_from_text(
-            joined_text, valid_names=valid_names, strict=strict)
+            joined_text, valid_names=valid_names, strict=strict,
+            guard_examples=feats.get("guard_tool_examples", True))
     else:
         parsed_blocks = [{"type": "text", "text": joined_text}] if joined_text else []
 
