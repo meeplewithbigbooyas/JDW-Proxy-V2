@@ -79,6 +79,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # rather than a real call. Prevents the model's own explanations about
         # tool calls from being truncated into a broken tool_use block.
         "guard_tool_examples": True,
+        # Remove the upstream harness's OWN tool JSON (system_todo_write /
+        # read_tabular) when it leaks into visible text as a raw blob. A tool
+        # the client actually offered under the same name is never stripped.
+        "strip_harness_tools": True,
         "flatten_tool_history": True,
         "strip_thinking": True,
         "enforce_max_tokens": True,
@@ -1057,6 +1061,73 @@ def detect_tool_leak(content_out: List[Dict[str, Any]]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Strip the upstream HARNESS's own tool JSON that leaks into visible text
+# --------------------------------------------------------------------------- #
+
+# The upstream relay is an "analysis agent" harness with its OWN private tools
+# (system_todo_write, read_tabular). On long step-by-step tasks the model under
+# the harness reflexively calls them, and when it writes the call as BARE JSON
+# in the text (no fence), it isn't one of the client's tools, so it survives as
+# a raw {"name": "system_todo_write", "input": {...}} blob dumped to the user.
+# We cut those blobs out of visible text. (Real client tool_use blocks and any
+# tool the client ACTUALLY offered are never touched -- see the guard below.)
+HARNESS_TOOL_NAMES = {"system_todo_write", "read_tabular"}
+
+# A fenced OR bare harness-tool call, matched so we can delete it from text.
+_HARNESS_FENCE_RE = re.compile(
+    r"```[A-Za-z0-9_+.\-]*[ \t]*\r?\n\s*\{\s*\"name\"\s*:\s*\"(system_todo_write|read_tabular)\".*?\}[ \t]*\r?\n?```",
+    re.DOTALL,
+)
+
+
+def strip_harness_tool_text(text: str, client_offered: set) -> str:
+    """Remove leaked harness-tool JSON (fenced or bare) from a text string.
+    A harness name the CLIENT actually offered is left intact (the client wants
+    it as a real tool, handled elsewhere)."""
+    if not text:
+        return text
+    targets = HARNESS_TOOL_NAMES - set(client_offered or ())
+    if not targets:
+        return text
+    if not any(t in text for t in targets):
+        return text
+    # 1) fenced form
+    def _fence_sub(m: "re.Match") -> str:
+        return "" if m.group(1) in targets else m.group(0)
+    out = _HARNESS_FENCE_RE.sub(_fence_sub, text)
+    # 2) bare brace-balanced form: walk every {"name": ...} object and drop the
+    #    ones whose name is a leaked harness tool.
+    removals: List[Tuple[int, int]] = []
+    for cstart, cend, cand in _iter_balanced_json_objects(out):
+        parsed = _loads_tool_json(cand.strip())
+        if isinstance(parsed, dict) and parsed.get("name") in targets:
+            removals.append((cstart, cend))
+    for cstart, cend in reversed(removals):
+        out = out[:cstart] + out[cend:]
+    # tidy up leftover blank lines from the cut
+    out = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", out)
+    return out.strip()
+
+
+def strip_harness_tools(content_out: List[Dict[str, Any]],
+                        client_offered: set) -> List[Dict[str, Any]]:
+    """Apply strip_harness_tool_text to every text block; drop blocks that end
+    up empty. tool_use / image / thinking blocks pass through untouched."""
+    cleaned: List[Dict[str, Any]] = []
+    for b in content_out:
+        if isinstance(b, dict) and b.get("type") == "text":
+            new_text = strip_harness_tool_text(b.get("text", ""), client_offered)
+            if new_text:
+                cleaned.append({"type": "text", "text": new_text})
+            else:
+                log_event({"harness_tool_stripped": True,
+                           "note": "removed leaked harness-tool JSON from text"})
+        else:
+            cleaned.append(b)
+    return cleaned
+
+
+# --------------------------------------------------------------------------- #
 # Post-processing of the upstream non-stream response
 # --------------------------------------------------------------------------- #
 
@@ -1173,6 +1244,17 @@ def process_upstream_message(upstream: Dict[str, Any],
     content_out.extend(parsed_blocks)
     if not content_out:
         content_out = [{"type": "text", "text": ""}]
+
+    # Strip the upstream harness's OWN leaked tool JSON (system_todo_write /
+    # read_tabular) from visible text -- unless the client itself offered a
+    # tool by that name. This removes the raw {"name": ...} blobs the harness
+    # dumps into text on long step-by-step tasks.
+    if feats.get("strip_harness_tools", True):
+        before = len(content_out)
+        content_out = strip_harness_tools(content_out, valid_names)
+        if not content_out:
+            content_out = [{"type": "text", "text": ""}]
+        _ = before  # (kept for clarity; count change is logged inside)
 
     # DEBUG (opt-in): catch a raw tool_call that leaked into a text block.
     if DEBUG_TOOL_LEAK:
