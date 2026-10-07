@@ -950,6 +950,7 @@ def parse_tool_calls_from_text(text: str,
     blocks: List[Dict[str, Any]] = []
     last = 0
     _match_count = 0
+    suppressed_truncated = False
     for m in TOOL_CALL_FENCE_RE.finditer(text):
         _match_count += 1
         pre = text[last:m.start()].strip()
@@ -1042,11 +1043,70 @@ def parse_tool_calls_from_text(text: str,
             produced_tool = True
             break
 
+    # RECOVERY: the relay sometimes TRUNCATES the response mid-tool-call, so the
+    # object never closes -> the balanced scanner above yields nothing and the
+    # call used to leak into visible text as a raw {"name": "grep", ...} blob.
+    # Here we take the text from the LAST {"name": hint to end-of-text and let
+    # _loads_tool_json repair the missing closers. We only accept the result if
+    # its name is a tool the client ACTUALLY offered -- so ordinary prose or a
+    # partial example is never force-parsed into a call.
+    if not produced_tool and valid_names and '"name"' in text:
+        hints = list(_NAME_HINT_RE.finditer(text))
+        if hints:
+            hstart = hints[-1].start()
+            parsed = _loads_tool_json(text[hstart:].strip())
+            name = parsed.get("name") if isinstance(parsed, dict) else None
+            if name in valid_names:
+                tool_input = parsed.get("input", parsed.get("arguments", {}))
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                pre = text[last:hstart].strip()
+                if pre:
+                    blocks.append({"type": "text", "text": pre})
+                blocks.append({
+                    "type": "tool_use",
+                    "id": "toolu_" + uuid.uuid4().hex[:24],
+                    "name": name,
+                    "input": tool_input,
+                })
+                last = len(text)
+                produced_tool = True
+                log_event({"recovered_truncated_tool": name,
+                           "note": "repaired a truncated/unclosed tool call"})
+            else:
+                # The fragment names an offered tool but is too truncated to
+                # repair (e.g. cut off at a dangling key with no value). Emitting
+                # it as text dumps a raw {"name": "grep", ...} blob at the user --
+                # the exact leak we are fixing. Suppress the fragment and leave a
+                # short, honest note so the client/user knows the turn was cut
+                # off (and can simply ask the model to continue).
+                frag_name = None
+                if isinstance(parsed, dict):
+                    frag_name = parsed.get("name")
+                if frag_name is None:
+                    m2 = re.search(r'"name"\s*:\s*"([^"]+)"', text[hstart:])
+                    frag_name = m2.group(1) if m2 else None
+                if frag_name in valid_names:
+                    pre = text[last:hstart].strip()
+                    if pre:
+                        blocks.append({"type": "text", "text": pre})
+                    last = len(text)
+                    produced_tool = True  # prevents the raw tail from leaking
+                    suppressed_truncated = True
+                    log_event({"dropped_truncated_tool": frag_name,
+                               "note": "tool call truncated beyond repair -> "
+                                       "fragment suppressed"})
+
     tail = text[last:].strip()
     if tail:
         blocks.append({"type": "text", "text": tail})
     if not blocks:
-        blocks.append({"type": "text", "text": text})
+        # Normally we fall back to the raw text so nothing is ever lost. But if
+        # we deliberately SUPPRESSED a truncated-beyond-repair tool fragment,
+        # resurrecting `text` here would re-leak the exact blob we just removed.
+        # In that case emit an empty text block instead.
+        blocks.append({"type": "text",
+                       "text": "" if suppressed_truncated else text})
     # DIAGNOSTIC: the regex found NO fence at all, yet the text clearly contains
     # a tool-call-ish fenced block. That means the FENCE REGEX failed to match
     # (not the JSON parser). Capture the raw so we can fix the pattern.
