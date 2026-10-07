@@ -14,6 +14,7 @@ venv/
 _logs_dump.json
 startup_out.txt
 startup_err.txt
+error_log.txt
 *.log
 
 # Local test / probe scratch

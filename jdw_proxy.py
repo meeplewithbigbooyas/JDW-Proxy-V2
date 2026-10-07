@@ -2246,6 +2246,40 @@ def anthropic_error(status: int, err_type: str, message: str) -> JSONResponse:
     )
 
 
+def _clean_upstream_error(raw_text: str, status: int, ctype: str = "") -> str:
+    """Turn an ugly upstream error body (often a full Cloudflare HTML page) into
+    a short, human-readable reason. Prevents '<!DOCTYPE html> <!--[if lt IE 7'
+    from being dumped into the dashboard / client error field."""
+    txt = (raw_text or "").strip()
+    looks_html = ("html" in (ctype or "").lower()
+                  or txt[:15].lower().startswith("<!doctype html")
+                  or txt[:5].lower() == "<html")
+    if looks_html:
+        # Cloudflare edge pages carry the real reason in a known phrase set.
+        low = txt.lower()
+        cf = {
+            502: "upstream is down (bad gateway)",
+            503: "upstream temporarily unavailable",
+            504: "upstream timed out (gateway timeout)",
+            520: "upstream returned an unknown error",
+            521: "upstream server is down",
+            522: "connection to upstream timed out",
+            523: "upstream is unreachable",
+            524: "upstream took too long to respond",
+        }
+        if status in cf:
+            return f"{cf[status]} (HTTP {status})"
+        for phrase in ("bad gateway", "service temporarily unavailable",
+                       "gateway timeout", "web server is down",
+                       "connection timed out", "origin is unreachable"):
+            if phrase in low:
+                return f"{phrase} (HTTP {status})"
+        return f"upstream returned an HTML error page (HTTP {status})"
+    # Non-HTML: collapse whitespace and cap length.
+    oneline = re.sub(r"\s+", " ", txt)
+    return oneline[:200] if oneline else f"upstream error (HTTP {status})"
+
+
 def _upstream_auth_headers(api_key: str, *, json_body: bool = True) -> Dict[str, str]:
     """Build upstream request headers. CRUCIAL: when the key is empty we must
     OMIT the auth headers entirely -- an empty 'Authorization: Bearer ' value
@@ -2331,7 +2365,9 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
                            "ctype": r.headers.get("content-type", "")})
                 data = {"_raw": raw_text,
                         "error": {"type": "api_error",
-                                  "message": raw_text[:500]}}
+                                  "message": _clean_upstream_error(
+                                      raw_text, status,
+                                      r.headers.get("content-type", ""))}}
             else:
                 # Parsed OK but a 2xx with no usable content is also a
                 # transient relay glitch -> retry.

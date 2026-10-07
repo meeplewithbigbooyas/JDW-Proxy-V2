@@ -403,10 +403,21 @@ async function saveConfig(){
 
 let LAST_LOGS=[];
 function fmtTime(ts){ const d=new Date(ts*1000); return d.toLocaleTimeString(); }
+// A log entry is a real request only if it carries a model + status (or an
+// error). Everything else (retry/attempt/parse_fail/note-only diagnostics) is
+// internal noise that used to render as a fake blank "ok" row and flood the
+// table. We hide those by default and show a small count instead.
+function isRealRequest(l){
+  if(l.key_used||l.key_rejected) return true;      // key-selection rows
+  if(l.error && l.model) return true;              // a failed request
+  if(l.model && l.status!==undefined && l.latency_s!==undefined) return true;
+  return false;
+}
 function renderLogs(logs){
   LAST_LOGS=logs;
   const body=document.getElementById('logBody');
-  if(!logs||!logs.length){ body.innerHTML='<tr><td colspan="7" class="empty">'+I18N[LANG].noLogs+'</td></tr>'; return; }
+  logs=(logs||[]).filter(isRealRequest);
+  if(!logs.length){ body.innerHTML='<tr><td colspan="7" class="empty">'+I18N[LANG].noLogs+'</td></tr>'; return; }
   body.innerHTML=logs.map(l=>{
     // Key-selection events (fallback logic): render a clear, dedicated row.
     if(l.key_used||l.key_rejected){
